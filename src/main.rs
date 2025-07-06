@@ -1,26 +1,18 @@
-//! Full-featured Rust CLI for wireless ADB setup, contact search, calling, phone unlock with persistence
-//! Includes animations, PIN/password storage, and reconnection to previously connected phones
+//! Full-featured Rust CLI for wireless ADB setup, contact search, and calling via Android phone
+//! Includes phone unlock and basic animated feedback
 
 use std::io::{self, Write};
-use std::process::{Command};
+use std::process::{Command, Stdio};
 use std::env;
 use std::thread::sleep;
 use std::time::Duration;
 use regex::Regex;
-use std::fs::{self, File, OpenOptions};
-use std::path::PathBuf;
-use std::io::Read;
-use std::collections::HashSet;
-use dirs;
 
 #[derive(Clone, Debug)]
 struct Contact {
     name: String,
     number: String,
 }
-
-const CONFIG_FILE: &str = ".phonectl_auth";
-const DEVICE_FILE: &str = ".phonectl_devices";
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -31,9 +23,7 @@ fn main() {
 
     match args[1].as_str() {
         "setup" => setup_adb_wifi(),
-        "config" => configure_unlock(),
         "unlock" => ensure_adb_connected(unlock_phone),
-        "reconnect" => reconnect_saved_device(),
         "list" => ensure_adb_connected(list_contacts),
         "search" if args.len() >= 3 => ensure_adb_connected(|| search_prompt(&args[2..].join(" "))),
         "call" if args.len() >= 3 => ensure_adb_connected(|| call_prompt(&args[2..].join(" "))),
@@ -48,87 +38,13 @@ fn print_help() {
     println!("Rust ADB Phone Control CLI");
     println!("Commands:");
     println!("  setup                     - Setup and connect ADB over Wi-Fi");
-    println!("  config                    - Setup and store unlock PIN/password");
-    println!("  unlock                    - Unlock the phone using saved PIN/password");
-    println!("  reconnect                 - Reconnect to a previously saved device IP");
+    println!("  unlock                    - Unlock the phone and keep it awake");
     println!("  list                      - List all contacts");
     println!("  search <query>           - Search contact by name or number");
     println!("  call <name|number>       - Call a contact or number");
     println!("  dial <name|number>       - Open dialer for a contact or number");
     println!("  answer                   - Answer incoming call");
     println!("  reject / end             - End or reject call");
-}
-
-fn get_config_path() -> PathBuf {
-    dirs::home_dir().unwrap().join(CONFIG_FILE)
-}
-
-fn get_device_file_path() -> PathBuf {
-    dirs::home_dir().unwrap().join(DEVICE_FILE)
-}
-
-fn configure_unlock() {
-    print!("Enter your phone unlock PIN/password: ");
-    io::stdout().flush().unwrap();
-    let mut pin = String::new();
-    io::stdin().read_line(&mut pin).unwrap();
-    let pin = pin.trim();
-
-    if pin.is_empty() {
-        println!("❌ Unlock code cannot be empty.");
-        return;
-    }
-
-    fs::write(get_config_path(), pin).expect("Failed to write unlock config");
-    println!("✅ Unlock PIN/password saved successfully.");
-}
-
-fn reconnect_saved_device() {
-    let path = get_device_file_path();
-    if !path.exists() {
-        println!("❌ No saved devices to reconnect.");
-        return;
-    }
-
-    let content = fs::read_to_string(path).unwrap_or_default();
-    let ips: HashSet<String> = content.lines().map(|s| s.trim().to_string()).collect();
-
-    for ip in &ips {
-        println!("🔄 Reconnecting to {ip}...");
-        adb(&["connect", ip]);
-        sleep(Duration::from_millis(300));
-    }
-
-    println!("✅ Reconnection attempts complete.");
-}
-
-fn unlock_phone() {
-    println!("🔓 Unlocking phone using stored credentials...");
-    let path = get_config_path();
-    if !path.exists() {
-        println!("⚠️ No unlock PIN/password saved. Run `phonectl config` first.");
-        return;
-    }
-
-    let mut pin = String::new();
-    File::open(path).unwrap().read_to_string(&mut pin).unwrap();
-    adb(&["shell", "input", "keyevent", "82"]);
-    sleep(Duration::from_millis(500));
-    adb(&["shell", "input", "text", &pin.trim().replace(" ", "")]);
-    sleep(Duration::from_millis(300));
-    adb(&["shell", "input", "keyevent", "66"]);
-    adb(&["shell", "svc", "power", "stayon", "true"]);
-    animation_spinner("Phone Unlocked and Awake");
-}
-
-fn animation_spinner(label: &str) {
-    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    for i in 0..spinner.len() {
-        print!("\r{} {}", spinner[i], label);
-        io::stdout().flush().unwrap();
-        sleep(Duration::from_millis(100));
-    }
-    println!("\r✅ {}", label);
 }
 
 fn adb(args: &[&str]) {
@@ -140,6 +56,16 @@ fn adb(args: &[&str]) {
     if !status.success() {
         eprintln!("ADB command failed: {:?}", args);
     }
+}
+
+fn animation_spinner(label: &str) {
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    for i in 0..spinner.len() {
+        print!("\r{} {}", spinner[i], label);
+        io::stdout().flush().unwrap();
+        sleep(Duration::from_millis(100));
+    }
+    println!("\r✅ {}", label);
 }
 
 fn is_adb_connected() -> bool {
@@ -190,15 +116,14 @@ fn setup_adb_wifi() {
     println!("📡 Connecting to ADB over Wi-Fi at {ip}");
     animation_spinner("Connecting to device");
     adb(&["connect", ip]);
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(get_device_file_path())
-        .expect("Unable to store device IP");
-    writeln!(file, "{}", ip).ok();
-
     println!("✅ Connected. You can now unplug the USB.");
+}
+
+fn unlock_phone() {
+    println!("🔓 Unlocking phone and keeping screen on...");
+    adb(&["shell", "input", "keyevent", "82"]); // Wake up & unlock
+    adb(&["shell", "svc", "power", "stayon", "true"]); // Keep screen awake
+    animation_spinner("Phone Unlocked and Awake");
 }
 
 fn get_contacts() -> Vec<Contact> {
