@@ -1,8 +1,11 @@
 //! Full-featured Rust CLI for wireless ADB setup, contact search, and calling via Android phone
+//! Includes phone unlock and basic animated feedback
 
 use std::io::{self, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::env;
+use std::thread::sleep;
+use std::time::Duration;
 use regex::Regex;
 
 #[derive(Clone, Debug)]
@@ -20,6 +23,7 @@ fn main() {
 
     match args[1].as_str() {
         "setup" => setup_adb_wifi(),
+        "unlock" => ensure_adb_connected(unlock_phone),
         "list" => ensure_adb_connected(list_contacts),
         "search" if args.len() >= 3 => ensure_adb_connected(|| search_prompt(&args[2..].join(" "))),
         "call" if args.len() >= 3 => ensure_adb_connected(|| call_prompt(&args[2..].join(" "))),
@@ -34,6 +38,7 @@ fn print_help() {
     println!("Rust ADB Phone Control CLI");
     println!("Commands:");
     println!("  setup                     - Setup and connect ADB over Wi-Fi");
+    println!("  unlock                    - Unlock the phone and keep it awake");
     println!("  list                      - List all contacts");
     println!("  search <query>           - Search contact by name or number");
     println!("  call <name|number>       - Call a contact or number");
@@ -51,6 +56,16 @@ fn adb(args: &[&str]) {
     if !status.success() {
         eprintln!("ADB command failed: {:?}", args);
     }
+}
+
+fn animation_spinner(label: &str) {
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    for i in 0..spinner.len() {
+        print!("\r{} {}", spinner[i], label);
+        io::stdout().flush().unwrap();
+        sleep(Duration::from_millis(100));
+    }
+    println!("\r✅ {}", label);
 }
 
 fn is_adb_connected() -> bool {
@@ -99,8 +114,16 @@ fn setup_adb_wifi() {
     }
 
     println!("📡 Connecting to ADB over Wi-Fi at {ip}");
+    animation_spinner("Connecting to device");
     adb(&["connect", ip]);
     println!("✅ Connected. You can now unplug the USB.");
+}
+
+fn unlock_phone() {
+    println!("🔓 Unlocking phone and keeping screen on...");
+    adb(&["shell", "input", "keyevent", "82"]); // Wake up & unlock
+    adb(&["shell", "svc", "power", "stayon", "true"]); // Keep screen awake
+    animation_spinner("Phone Unlocked and Awake");
 }
 
 fn get_contacts() -> Vec<Contact> {
