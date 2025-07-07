@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 aes-gcm = "0.10.3"
+base64 = "0.22.1"
 dir = "0.1.2"
 dirs = "6.0.0"
+engine = "0.0.0"
 rand = "0.9.1"
 regex = "1.11.1"

@@ -1,5 +1,6 @@
-//! Full-featured Rust CLI for wireless ADB setup, contact search, calling, phone unlock with persistence
-//! Includes animations, PIN/password storage with encryption, and reconnection to previously connected phones
+//! Full-featured Rust CLI for wireless ADB phone control with audio routing
+//! Includes: ADB setup, contact search, calling, phone unlock, call audio routing
+//! By Sanjai Shaarugesh - https://github.com/Sanjai-Shaarugesh
 
 use aes_gcm::aead::Aead;
 use aes_gcm::aead::generic_array::GenericArray;
@@ -7,6 +8,7 @@ use aes_gcm::{Aes256Gcm, KeyInit};
 use base64;
 use dirs;
 use rand::Rng;
+
 use regex::Regex;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -18,6 +20,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Debug)]
 struct Contact {
@@ -28,6 +32,9 @@ struct Contact {
 const CONFIG_FILE: &str = ".phonectl_auth";
 const DEVICE_FILE: &str = ".phonectl_devices";
 const KEY_FILE: &str = ".phonectl_key";
+const AUDIO_FORWARD_PORT: &str = "28200";
+
+static AUDIO_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -52,13 +59,20 @@ fn main() {
             ensure_adb_connected(|| adb(&["shell", "input", "keyevent", "KEYCODE_ENDCALL"]))
         }
         "wake" => ensure_adb_connected(wake_phone),
+        "audio" => ensure_adb_connected(|| {
+            if args.len() >= 3 {
+                handle_audio(&args[2])
+            } else {
+                println!("Usage: phonectl audio <start|stop|status>");
+            }
+        }),
         "about" => show_about(),
         _ => print_help(),
     }
 }
 
 fn print_help() {
-    println!("📱 Rust ADB Phone Control CLI v1.1");
+    println!("📱 Rust ADB Phone Control CLI v1.2");
     println!("=================================");
     println!("Commands:");
     println!("  setup                     - Complete setup wizard for new device");
@@ -66,13 +80,14 @@ fn print_help() {
     println!("  unlock                    - Unlock the phone using saved PIN/password");
     println!("  reconnect                 - Reconnect to previously saved devices");
     println!("  list                      - List all contacts");
-    println!("  search <query>           - Search contact by name or number");
-    println!("  call <name|number>       - Call a contact or number");
-    println!("  dial <name|number>       - Open dialer for a contact or number");
-    println!("  answer                   - Answer incoming call");
-    println!("  reject / end             - End or reject call");
-    println!("  wake                     - Wake up the phone screen");
-    println!("  about                    - Show developer details");
+    println!("  search <query>            - Search contact by name or number");
+    println!("  call <name|number>        - Call a contact or number");
+    println!("  dial <name|number>        - Open dialer for a contact or number");
+    println!("  answer                    - Answer incoming call");
+    println!("  reject / end              - End or reject call");
+    println!("  wake                      - Wake up the phone screen");
+    println!("  audio <start|stop|status> - Manage call audio routing");
+    println!("  about                     - Show developer details");
     println!("");
     println!("First time setup: Connect phone via USB and run 'phonectl setup'");
 }
@@ -80,7 +95,7 @@ fn print_help() {
 fn show_about() {
     println!("📱 Wireless ADB Phone Control CLI");
     println!("==================================");
-    println!("Version: 1.1");
+    println!("Version: 1.2");
     println!("Developer: Sanjai Shaarugesh");
     println!("GitHub: https://github.com/Sanjai-Shaarugesh/phonectl");
     println!("Description: Full-featured Rust CLI for wireless ADB control");
@@ -90,6 +105,7 @@ fn show_about() {
     println!("  • Contact management");
     println!("  • Call/SMS functionality");
     println!("  • Phone unlock automation");
+    println!("  • Full-duplex call audio routing");
     println!("");
     println!("License: MIT");
     println!("Built with ❤️ in Rust");
@@ -112,14 +128,14 @@ fn generate_or_get_key() -> [u8; 32] {
 
     if key_path.exists() {
         let encoded = fs::read_to_string(key_path).unwrap();
-        let decoded = base64::decode_config(encoded.trim(), base64::STANDARD_NO_PAD).unwrap();
+        let decoded = base64::decode(encoded.trim()).unwrap();
         let mut key = [0u8; 32];
         key.copy_from_slice(&decoded);
         key
     } else {
         let mut rng = rand::rng();
-        let key: [u8; 32] = rng.random();
-        let encoded = base64::encode_config(key, base64::STANDARD_NO_PAD);
+        let key: [u8; 32] = rng.r#gen();
+        let encoded = base64::encode(key);
         fs::write(key_path, encoded).unwrap();
         key
     }
@@ -135,7 +151,7 @@ fn encrypt_data(data: &str) -> String {
     let ciphertext = cipher.encrypt(nonce, data.as_bytes()).unwrap();
     let mut result = nonce_bytes.to_vec();
     result.extend_from_slice(&ciphertext);
-    base64::encode_config(result, base64::STANDARD_NO_PAD)
+    base64::encode(result)
 }
 
 fn decrypt_data(encrypted: &str) -> Result<String, String> {
@@ -144,7 +160,7 @@ fn decrypt_data(encrypted: &str) -> Result<String, String> {
     let key_array = GenericArray::from_slice(&key);
     let cipher = Aes256Gcm::new(key_array);
 
-    let data = base64::decode_config(encrypted, base64::STANDARD_NO_PAD)
+    let data = base64::decode(encrypted)
         .map_err(|e| format!("Base64 decode error: {}", e))?;
     if data.len() < 12 {
         return Err("Invalid encrypted data".to_string());
@@ -631,6 +647,11 @@ fn prompt_and_exec(filtered: Vec<Contact>, action: &str) {
         "-d",
         &format!("tel:{}", selected.number),
     ]);
+
+    if action == "call" {
+        println!("🔄 Starting audio routing for call...");
+        start_audio_routing();
+    }
 }
 
 fn call_prompt(query: &str) {
@@ -667,4 +688,130 @@ fn dial_prompt(query: &str) {
             .collect()
     };
     prompt_and_exec(filtered, "dial");
+}
+
+// Audio routing functions
+fn handle_audio(command: &str) {
+    match command {
+        "start" => start_audio_routing(),
+        "stop" => stop_audio_routing(),
+        "status" => check_audio_status(),
+        _ => println!("Invalid audio command. Use: start, stop, status"),
+    }
+}
+
+fn start_audio_routing() {
+    if AUDIO_ACTIVE.load(Ordering::SeqCst) {
+        println!("🔊 Audio routing is already active");
+        return;
+    }
+
+    println!("🔊 Starting audio routing...");
+
+    // 1. Start audio output (phone to PC)
+    let audio_output = Command::new("sndcpy")
+        .spawn()
+        .map(|_| println!("✅ Phone audio → PC speakers"))
+        .err();
+
+    // 2. Set up port forwarding
+    let forward = Command::new("adb")
+        .args(&["forward", &format!("tcp:{}", AUDIO_FORWARD_PORT), &format!("tcp:{}", AUDIO_FORWARD_PORT)])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !forward {
+        println!("❌ Failed to set up audio forwarding port");
+        return;
+    }
+
+    // 3. Start microphone input (PC to phone)
+    let mic_input = Command::new("bash")
+           .arg("-c")
+           .arg(&format!(
+               "arecord -f cd - | ncat --send-only localhost {}",
+               AUDIO_FORWARD_PORT
+           ))
+           .spawn()
+           .map(|_| println!("✅ PC microphone → Phone call (via ncat)"))
+           .err();
+
+
+    if audio_output.is_none() && mic_input.is_none() {
+        AUDIO_ACTIVE.store(true, Ordering::SeqCst);
+        println!("🎧 Audio routing active! Press Ctrl+C to stop.");
+        println!("   • Phone audio → PC speakers");
+        println!("   • PC microphone → Phone call");
+    }else {
+            println!("❌ Failed to start audio routing. Ensure:");
+            println!("   • sndcpy is installed (https://github.com/rom1v/sndcpy)");
+            println!("   • arecord and ncat are installed (sudo apt install sox nmap)");
+        }
+}
+
+fn stop_audio_routing() {
+    if !AUDIO_ACTIVE.load(Ordering::SeqCst) {
+        println!("🔇 Audio routing is not active");
+        return;
+    }
+
+    println!("🔇 Stopping audio routing...");
+
+    // Kill sndcpy processes
+    let _ = Command::new("pkill")
+        .arg("sndcpy")
+        .status();
+
+    // Kill netcat processes
+    let _ = Command::new("pkill")
+          .arg("ncat")
+          .status();
+
+    // Remove port forwarding
+    let _ = Command::new("adb")
+        .args(&["forward", "--remove", &format!("tcp:{}", AUDIO_FORWARD_PORT)])
+        .status();
+
+    AUDIO_ACTIVE.store(false, Ordering::SeqCst);
+    println!("✅ Audio routing stopped");
+}
+
+fn check_audio_status() {
+    println!("🎧 Audio Routing Status:");
+
+    // Check sndcpy
+    let sndcpy_running = Command::new("pgrep")
+        .arg("sndcpy")
+        .stdout(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    // Check netcat
+    let nc_running = Command::new("pgrep")
+           .arg("ncat")
+           .stdout(Stdio::null())
+           .status()
+           .map(|s| s.success())
+           .unwrap_or(false);
+
+    // Check port forwarding
+    let port_forwarded = Command::new("adb")
+        .args(&["forward", "--list"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("tcp:{}", AUDIO_FORWARD_PORT)))
+        .unwrap_or(false);
+
+    println!("  • Audio output active: {}", if sndcpy_running { "✅" } else { "❌" });
+    println!("  • Microphone input active: {}", if nc_running { "✅" } else { "❌" });
+    println!("  • Port forwarding active: {}", if port_forwarded { "✅" } else { "❌" });
+
+    if sndcpy_running && nc_running && port_forwarded {
+        println!("🔊 Audio routing is fully operational");
+    } else if !sndcpy_running && !nc_running && !port_forwarded {
+        println!("🔇 Audio routing is inactive");
+    } else {
+        println!("⚠️ Audio routing is partially active");
+    }
 }
