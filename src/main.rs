@@ -81,8 +81,8 @@ fn show_about() {
     println!("📱 Wireless ADB Phone Control CLI");
     println!("==================================");
     println!("Version: 1.1");
-    println!("Developer: Your Name");
-    println!("GitHub: https://github.com/yourusername/wireless-adb-cli");
+    println!("Developer: Sanjai Shaarugesh");
+    println!("GitHub: https://github.com/Sanjai-Shaarugesh/phonectl");
     println!("Description: Full-featured Rust CLI for wireless ADB control");
     println!("Features:");
     println!("  • Encrypted credential storage");
