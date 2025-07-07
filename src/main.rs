@@ -8,6 +8,7 @@ use aes_gcm::{Aes256Gcm, KeyInit};
 use base64;
 use dirs;
 use rand::Rng;
+use base64::Engine;
 
 use regex::Regex;
 use std::collections::HashMap;
@@ -43,31 +44,52 @@ fn main() {
         return;
     }
 
-    match args[1].as_str() {
-        "setup" => setup_wizard(),
-        "config" => configure_unlock(),
-        "unlock" => ensure_adb_connected(unlock_phone),
-        "reconnect" => reconnect_saved_device(),
-        "list" => ensure_adb_connected(list_contacts),
-        "search" if args.len() >= 3 => ensure_adb_connected(|| search_prompt(&args[2..].join(" "))),
-        "call" if args.len() >= 3 => ensure_adb_connected(|| call_prompt(&args[2..].join(" "))),
-        "dial" if args.len() >= 3 => ensure_adb_connected(|| dial_prompt(&args[2..].join(" "))),
-        "answer" => {
-            ensure_adb_connected(|| adb(&["shell", "input", "swipe", "500", "1600", "500", "1000"]))
+    let cmd = args[1].as_str();
+
+    if cmd == "setup" {
+        setup_wizard();
+    } else if cmd == "config" {
+        configure_unlock();
+    } else if cmd == "unlock" {
+        ensure_adb_connected(unlock_phone);
+    } else if cmd == "reconnect" {
+        reconnect_saved_device();
+    } else if cmd == "list" {
+        ensure_adb_connected(list_contacts);
+    } else if cmd == "search" {
+        if args.len() >= 3 {
+            ensure_adb_connected(|| search_prompt(&args[2..].join(" ")));
+        } else {
+            println!("❌ Usage: phonectl search <name|number>");
         }
-        "reject" | "end" => {
-            ensure_adb_connected(|| adb(&["shell", "input", "keyevent", "KEYCODE_ENDCALL"]))
+    } else if cmd == "call" {
+        if args.len() >= 3 {
+            ensure_adb_connected(|| call_prompt(&args[2..].join(" ")));
+        } else {
+            println!("❌ Usage: phonectl call <name|number>");
         }
-        "wake" => ensure_adb_connected(wake_phone),
-        "audio" => ensure_adb_connected(|| {
-            if args.len() >= 3 {
-                handle_audio(&args[2])
-            } else {
-                println!("Usage: phonectl audio <start|stop|status>");
-            }
-        }),
-        "about" => show_about(),
-        _ => print_help(),
+    } else if cmd == "dial" {
+        if args.len() >= 3 {
+            ensure_adb_connected(|| dial_prompt(&args[2..].join(" ")));
+        } else {
+            println!("❌ Usage: phonectl dial <name|number>");
+        }
+    } else if cmd == "answer" {
+        ensure_adb_connected(|| adb(&["shell", "input", "swipe", "500", "1600", "500", "1000"]));
+    } else if cmd == "reject" || cmd == "end" {
+        ensure_adb_connected(|| adb(&["shell", "input", "keyevent", "KEYCODE_ENDCALL"]));
+    } else if cmd == "wake" {
+        ensure_adb_connected(wake_phone);
+    } else if cmd == "audio" {
+        if args.len() >= 3 {
+            ensure_adb_connected(|| handle_audio(&args[2]));
+        } else {
+            println!("Usage: phonectl audio <start|stop|status>");
+        }
+    } else if cmd == "about" {
+        show_about();
+    } else {
+        print_help();
     }
 }
 
@@ -127,18 +149,26 @@ fn generate_or_get_key() -> [u8; 32] {
     let key_path = get_key_file_path();
 
     if key_path.exists() {
-        let encoded = fs::read_to_string(key_path).unwrap();
-        let decoded = base64::decode(encoded.trim()).unwrap();
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        key
-    } else {
-        let mut rng = rand::rng();
-        let key: [u8; 32] = rng.r#gen();
-        let encoded = base64::encode(key);
-        fs::write(key_path, encoded).unwrap();
-        key
+        let encoded = fs::read_to_string(&key_path).unwrap_or_default();
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) {
+            if decoded.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&decoded);
+                return key;
+            } else {
+                eprintln!("⚠️ Invalid key length found. Regenerating secure key...");
+            }
+        } else {
+            eprintln!("⚠️ Corrupted key data. Regenerating secure key...");
+        }
     }
+
+    // Generate new key and save
+    let mut rng = rand::thread_rng();
+    let key: [u8; 32] = rng.r#gen();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+    fs::write(key_path, encoded).expect("Failed to write key file");
+    key
 }
 
 fn encrypt_data(data: &str) -> String {
@@ -151,7 +181,7 @@ fn encrypt_data(data: &str) -> String {
     let ciphertext = cipher.encrypt(nonce, data.as_bytes()).unwrap();
     let mut result = nonce_bytes.to_vec();
     result.extend_from_slice(&ciphertext);
-    base64::encode(result)
+    base64::engine::general_purpose::STANDARD.encode(result)
 }
 
 fn decrypt_data(encrypted: &str) -> Result<String, String> {
@@ -266,18 +296,21 @@ fn setup_wizard() {
     println!("");
     println!("Step 6: Connecting wirelessly...");
     animation_spinner("Establishing wireless connection");
-    let status = Command::new("adb")
+    let output = Command::new("adb")
         .args(&["connect", &format!("{}:5555", ip)])
-        .status()
+        .output()
         .expect("Failed to run adb connect");
 
-    if !status.success() {
+    if !output.status.success() {
         println!("❌ Wireless connection failed. Please retry setup.");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("Error details: {}", stderr);
         return;
     }
 
     // Step 7: Save device
     save_device_ip(&ip);
+    set_current_device(&format!("{}:5555", ip));
 
     // Step 8: Test connection
     println!("Step 7: Testing wireless connection...");
@@ -310,13 +343,13 @@ fn check_adb_installed() -> bool {
 }
 
 fn get_usb_devices() -> HashMap<String, String> {
-    let _output = Command::new("adb")
+    let output = Command::new("adb")
         .args(&["devices", "-l"])
         .output()
         .expect("Failed to run adb devices");
 
     let mut devices = HashMap::new();
-    let out = String::from_utf8_lossy(&_output.stdout);
+    let out = String::from_utf8_lossy(&output.stdout);
 
     for line in out.lines().skip(1) {
         if line.trim().is_empty() {
@@ -343,28 +376,59 @@ fn get_usb_devices() -> HashMap<String, String> {
 }
 
 fn get_device_ip(device_id: &str) -> String {
-    let _output = Command::new("adb")
+    let output = Command::new("adb")
         .args(&["-s", device_id, "shell", "ip", "addr", "show", "wlan0"])
         .output()
         .expect("Failed to get IP address");
 
-    let stdout = String::from_utf8_lossy(&_output.stdout);
-    let re = Regex::new(r"inet (\d+\.\d+\.\d+\.\d+)").unwrap();
+    if !output.status.success() {
+        // Try alternative method if wlan0 fails
+        let output = Command::new("adb")
+            .args(&["-s", device_id, "shell", "ifconfig"])
+            .output()
+            .expect("Failed to get IP address");
 
-    re.captures_iter(&stdout)
-        .next()
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_default()
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let re = Regex::new(r"inet (\d+\.\d+\.\d+\.\d+)").unwrap();
+
+        re.captures_iter(&stdout)
+            .next()
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default()
+    } else {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let re = Regex::new(r"inet (\d+\.\d+\.\d+\.\d+)").unwrap();
+
+        re.captures_iter(&stdout)
+            .next()
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default()
+    }
 }
 
 fn save_device_ip(ip: &str) {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(get_device_file_path())
-        .expect("Unable to store device IP");
-    writeln!(file, "{}:5555", ip).ok();
+    let mut existing = HashSet::new();
+    let path = get_device_file_path();
+
+    if path.exists() {
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        for line in content.lines() {
+            existing.insert(line.trim().to_string());
+        }
+    }
+
+    if !existing.contains(ip) {
+        existing.insert(ip.to_string());
+        let content = existing.into_iter().collect::<Vec<_>>().join("\n");
+        fs::write(path, content).expect("Unable to store device IP");
+    }
+}
+
+fn set_current_device(ip: &str) {
+    let path = dirs::home_dir().unwrap().join(".phonectl_current");
+    fs::write(path, ip).expect("Failed to write current device");
 }
 
 fn configure_unlock() {
@@ -420,12 +484,18 @@ fn reconnect_saved_device() {
 
         sleep(Duration::from_millis(500));
 
-        if is_adb_connected() {
-            println!("✅ Successfully connected to {}", ip);
-            connected = true;
-            break;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains("connected") {
+                set_current_device(ip);
+                println!("✅ Successfully connected to {}", ip);
+                connected = true;
+                break;
+            }
         } else {
             println!("❌ Failed to connect to {}", ip);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("Error details: {}", stderr);
         }
     }
 
@@ -493,7 +563,8 @@ fn animation_spinner(label: &str) {
         io::stdout().flush().unwrap();
         sleep(Duration::from_millis(100));
     }
-    println!("\r✅ {}", label);
+    print!("\r");
+    io::stdout().flush().unwrap();
 }
 
 fn adb(args: &[&str]) {
@@ -508,14 +579,23 @@ fn adb(args: &[&str]) {
 }
 
 fn is_adb_connected() -> bool {
+    let path = dirs::home_dir().unwrap().join(".phonectl_current");
+    if !path.exists() {
+        return false;
+    }
+
+    let current_ip = fs::read_to_string(path).unwrap_or_default();
+    if current_ip.is_empty() {
+        return false;
+    }
+
     let output = Command::new("adb")
         .arg("devices")
         .output()
         .expect("Failed to run adb devices");
 
     let out = String::from_utf8_lossy(&output.stdout);
-    out.lines()
-        .any(|line| line.contains("device") && !line.contains("List"))
+    out.lines().any(|l| l.contains(&current_ip) && l.contains("device"))
 }
 
 fn ensure_adb_connected<F: FnOnce()>(func: F) {
@@ -700,6 +780,18 @@ fn handle_audio(command: &str) {
     }
 }
 
+fn get_distro_hint() -> &'static str {
+    if std::path::Path::new("/etc/fedora-release").exists() {
+        "sudo dnf install sox nmap-ncat"
+    } else if std::path::Path::new("/etc/debian_version").exists() {
+        "sudo apt install sox netcat-openbsd"
+    } else if std::path::Path::new("/etc/arch-release").exists() {
+        "sudo pacman -S sox netcat"
+    } else {
+        "Install sox and netcat using your distro's package manager"
+    }
+}
+
 fn start_audio_routing() {
     if AUDIO_ACTIVE.load(Ordering::SeqCst) {
         println!("🔊 Audio routing is already active");
@@ -708,13 +800,7 @@ fn start_audio_routing() {
 
     println!("🔊 Starting audio routing...");
 
-    // 1. Start audio output (phone to PC)
-    let audio_output = Command::new("sndcpy")
-        .spawn()
-        .map(|_| println!("✅ Phone audio → PC speakers"))
-        .err();
-
-    // 2. Set up port forwarding
+    // 1. Set up port forwarding
     let forward = Command::new("adb")
         .args(&["forward", &format!("tcp:{}", AUDIO_FORWARD_PORT), &format!("tcp:{}", AUDIO_FORWARD_PORT)])
         .status()
@@ -726,28 +812,47 @@ fn start_audio_routing() {
         return;
     }
 
+    // 2. Start audio output (phone to PC)
+    let audio_output = Command::new("sndcpy")
+        .spawn()
+        .map(|_| {
+            println!("✅ Phone audio → PC speakers");
+            true
+        })
+        .unwrap_or_else(|_| {
+            println!("❌ Failed to start sndcpy. Install it from https://github.com/rom1v/sndcpy");
+            false
+        });
+
     // 3. Start microphone input (PC to phone)
-    let mic_input = Command::new("bash")
-           .arg("-c")
-           .arg(&format!(
-               "arecord -f cd - | ncat --send-only localhost {}",
-               AUDIO_FORWARD_PORT
-           ))
-           .spawn()
-           .map(|_| println!("✅ PC microphone → Phone call (via ncat)"))
-           .err();
+    let mic_input = if audio_output {
+        Command::new("bash")
+            .arg("-c")
+            .arg(&format!(
+                "arecord -f cd - | nc localhost {}",
+                AUDIO_FORWARD_PORT
+            ))
+            .spawn()
+            .map(|_| {
+                println!("✅ PC microphone → Phone call");
+                true
+            })
+            .unwrap_or_else(|_| {
+                println!("❌ Failed to start microphone routing. Ensure:");
+                println!("   • arecord and netcat are installed");
+                println!("   • {}", get_distro_hint());
+                false
+            })
+    } else {
+        false
+    };
 
-
-    if audio_output.is_none() && mic_input.is_none() {
+    if audio_output && mic_input {
         AUDIO_ACTIVE.store(true, Ordering::SeqCst);
-        println!("🎧 Audio routing active! Press Ctrl+C to stop.");
-        println!("   • Phone audio → PC speakers");
-        println!("   • PC microphone → Phone call");
-    }else {
-            println!("❌ Failed to start audio routing. Ensure:");
-            println!("   • sndcpy is installed (https://github.com/rom1v/sndcpy)");
-            println!("   • arecord and ncat are installed (sudo apt install sox nmap)");
-        }
+        println!("🎧 Audio routing active! Press Ctrl+C in this terminal to stop.");
+    } else {
+        println!("❌ Audio routing failed to start completely");
+    }
 }
 
 fn stop_audio_routing() {
@@ -765,8 +870,8 @@ fn stop_audio_routing() {
 
     // Kill netcat processes
     let _ = Command::new("pkill")
-          .arg("ncat")
-          .status();
+        .arg("nc")
+        .status();
 
     // Remove port forwarding
     let _ = Command::new("adb")
@@ -790,11 +895,11 @@ fn check_audio_status() {
 
     // Check netcat
     let nc_running = Command::new("pgrep")
-           .arg("ncat")
-           .stdout(Stdio::null())
-           .status()
-           .map(|s| s.success())
-           .unwrap_or(false);
+        .arg("nc")
+        .stdout(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
 
     // Check port forwarding
     let port_forwarded = Command::new("adb")
