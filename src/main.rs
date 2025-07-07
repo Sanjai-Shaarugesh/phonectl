@@ -1,27 +1,33 @@
 //! Full-featured Rust CLI for wireless ADB phone control with audio routing
-//! Includes: ADB setup, contact search, calling, phone unlock, call audio routing
+//! Optimized for Fedora Linux with pattern unlock support
 //! By Sanjai Shaarugesh - https://github.com/Sanjai-Shaarugesh
 
 use aes_gcm::aead::Aead;
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::{Aes256Gcm, KeyInit};
+use std::process::Command;
+use std::thread::sleep;
+use std::time::Duration;
 use base64;
 use dirs;
 use rand::Rng;
+use std::path::Path;
 use base64::Engine;
+use tempfile;
+use reqwest;
+use zip;
+use std::fs::File;
+use std::io::copy;
 
 use regex::Regex;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::Read;
-use std::io::{self, Write};
+use std::fs;
+use std::io::{self, Write, Read};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::Duration;
-use std::sync::{Arc, Mutex};
+use std::process::{Stdio};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Debug)]
@@ -30,6 +36,7 @@ struct Contact {
     number: String,
 }
 
+const APK: &[u8] = include_bytes!("../assets/sndcpy.apk");
 const CONFIG_FILE: &str = ".phonectl_auth";
 const DEVICE_FILE: &str = ".phonectl_devices";
 const KEY_FILE: &str = ".phonectl_key";
@@ -37,12 +44,16 @@ const AUDIO_FORWARD_PORT: &str = "28200";
 
 static AUDIO_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         print_help();
         return;
     }
+
+     let _temp_path = Path::new("assets");
 
     let cmd = args[1].as_str();
 
@@ -75,9 +86,9 @@ fn main() {
             println!("❌ Usage: phonectl dial <name|number>");
         }
     } else if cmd == "answer" {
-        ensure_adb_connected(|| adb(&["shell", "input", "swipe", "500", "1600", "500", "1000"]));
+        ensure_adb_connected(answer_call);
     } else if cmd == "reject" || cmd == "end" {
-        ensure_adb_connected(|| adb(&["shell", "input", "keyevent", "KEYCODE_ENDCALL"]));
+        ensure_adb_connected(end_call);
     } else if cmd == "wake" {
         ensure_adb_connected(wake_phone);
     } else if cmd == "audio" {
@@ -94,12 +105,12 @@ fn main() {
 }
 
 fn print_help() {
-    println!("📱 Rust ADB Phone Control CLI v1.2");
-    println!("=================================");
+    println!("📱 Rust ADB Phone Control CLI v1.5 (Fedora)");
+    println!("===========================================");
     println!("Commands:");
     println!("  setup                     - Complete setup wizard for new device");
-    println!("  config                    - Setup and store unlock PIN/password (encrypted)");
-    println!("  unlock                    - Unlock the phone using saved PIN/password");
+    println!("  config                    - Setup and store unlock PIN/pattern (encrypted)");
+    println!("  unlock                    - Unlock the phone using saved PIN/pattern");
     println!("  reconnect                 - Reconnect to previously saved devices");
     println!("  list                      - List all contacts");
     println!("  search <query>            - Search contact by name or number");
@@ -112,20 +123,23 @@ fn print_help() {
     println!("  about                     - Show developer details");
     println!("");
     println!("First time setup: Connect phone via USB and run 'phonectl setup'");
+    println!("Fedora dependencies: sudo dnf install android-tools sox alsa-utils nmap-ncat");
 }
 
 fn show_about() {
-    println!("📱 Wireless ADB Phone Control CLI");
-    println!("==================================");
-    println!("Version: 1.2");
+    println!("📱 Wireless ADB Phone Control CLI (Fedora)");
+    println!("==========================================");
+    println!("Version: 1.5");
     println!("Developer: Sanjai Shaarugesh");
     println!("GitHub: https://github.com/Sanjai-Shaarugesh/phonectl");
     println!("Description: Full-featured Rust CLI for wireless ADB control");
+    println!("Optimized for Fedora Linux");
     println!("Features:");
     println!("  • Encrypted credential storage");
+    println!("  • Pattern unlock support");
     println!("  • Automatic device reconnection");
     println!("  • Contact management");
-    println!("  • Call/SMS functionality");
+    println!("  • Call functionality");
     println!("  • Phone unlock automation");
     println!("  • Full-duplex call audio routing");
     println!("");
@@ -164,8 +178,8 @@ fn generate_or_get_key() -> [u8; 32] {
     }
 
     // Generate new key and save
-    let mut rng = rand::thread_rng();
-    let key: [u8; 32] = rng.r#gen();
+    let mut rng = rand::rng();
+    let key: [u8; 32] = rng.random();
     let encoded = base64::engine::general_purpose::STANDARD.encode(key);
     fs::write(key_path, encoded).expect("Failed to write key file");
     key
@@ -175,7 +189,8 @@ fn encrypt_data(data: &str) -> String {
     let key = generate_or_get_key();
     let key_array = GenericArray::from_slice(&key);
     let cipher = Aes256Gcm::new(key_array);
-    let nonce_bytes: [u8; 12] = rand::rng().random();
+    let mut rng = rand::rng();
+    let nonce_bytes: [u8; 12] = rng.random();
     let nonce = GenericArray::from_slice(&nonce_bytes);
 
     let ciphertext = cipher.encrypt(nonce, data.as_bytes()).unwrap();
@@ -190,7 +205,7 @@ fn decrypt_data(encrypted: &str) -> Result<String, String> {
     let key_array = GenericArray::from_slice(&key);
     let cipher = Aes256Gcm::new(key_array);
 
-    let data = base64::decode(encrypted)
+    let data = base64::engine::general_purpose::STANDARD.decode(encrypted)
         .map_err(|e| format!("Base64 decode error: {}", e))?;
     if data.len() < 12 {
         return Err("Invalid encrypted data".to_string());
@@ -209,12 +224,14 @@ fn setup_wizard() {
     println!("🚀 Welcome to ADB Wireless Setup Wizard!");
     println!("========================================");
     println!("");
+    println!("NOTE: Fedora requires additional packages:");
+    println!("sudo dnf install android-tools sox alsa-utils nmap-ncat");
 
     // Step 1: Check ADB
     println!("Step 1: Checking ADB installation...");
     if !check_adb_installed() {
         println!("❌ ADB not found. Please install Android SDK Platform Tools first.");
-        println!("Download from: https://developer.android.com/studio/releases/platform-tools");
+        println!("Fedora: sudo dnf install android-tools");
         return;
     }
     println!("✅ ADB is installed and ready");
@@ -434,20 +451,66 @@ fn set_current_device(ip: &str) {
 fn configure_unlock() {
     println!("🔐 Configure Phone Unlock");
     println!("=========================");
-    print!("Enter your phone unlock PIN/password: ");
+    println!("Enter your phone unlock method:");
+    println!("1. PIN/Password");
+    println!("2. Pattern");
+    print!("Select option (1/2): ");
     io::stdout().flush().unwrap();
-    let mut pin = String::new();
-    io::stdin().read_line(&mut pin).unwrap();
-    let pin = pin.trim();
 
-    if pin.is_empty() {
-        println!("❌ Unlock code cannot be empty.");
+    let mut option = String::new();
+    io::stdin().read_line(&mut option).unwrap();
+    let option = option.trim();
+
+    if option == "1" {
+        print!("Enter your phone unlock PIN/password: ");
+        io::stdout().flush().unwrap();
+        let mut pin = String::new();
+        io::stdin().read_line(&mut pin).unwrap();
+        let pin = pin.trim();
+
+        if pin.is_empty() {
+            println!("❌ Unlock code cannot be empty.");
+            return;
+        }
+
+        let encrypted = encrypt_data(&format!("PIN:{}", pin));
+        fs::write(get_config_path(), encrypted).expect("Failed to write unlock config");
+        println!("✅ Unlock PIN/password saved successfully (encrypted).");
+    } else if option == "2" {
+        println!("🔐 Enter your unlock pattern using the 3×3 grid below:");
+        println!("+---+---+---+");
+        println!("| 1 | 2 | 3 |");
+        println!("+---+---+---+");
+        println!("| 4 | 5 | 6 |");
+        println!("+---+---+---+");
+        println!("| 7 | 8 | 9 |");
+        println!("+---+---+---+");
+        println!("👉 Example: For an 'L' pattern, enter 14789");
+        print!("🧩 Pattern: ");
+
+        io::stdout().flush().unwrap();
+        let mut pattern = String::new();
+        io::stdin().read_line(&mut pattern).unwrap();
+        let pattern = pattern.trim();
+
+        if pattern.is_empty() {
+            println!("❌ Pattern cannot be empty.");
+            return;
+        }
+
+        if !pattern.chars().all(|c| c.is_ascii_digit() && c >= '1' && c <= '9') {
+            println!("❌ Invalid pattern. Only numbers 1-9 allowed.");
+            return;
+        }
+
+        let encrypted = encrypt_data(&format!("PATTERN:{}", pattern));
+        fs::write(get_config_path(), encrypted).expect("Failed to write unlock config");
+        println!("✅ Unlock pattern saved successfully (encrypted).");
+    } else {
+        println!("❌ Invalid option selected.");
         return;
     }
 
-    let encrypted = encrypt_data(pin);
-    fs::write(get_config_path(), encrypted).expect("Failed to write unlock config");
-    println!("✅ Unlock PIN/password saved successfully (encrypted).");
     println!("🔒 Your credentials are stored encrypted on disk.");
 }
 
@@ -511,12 +574,12 @@ fn unlock_phone() {
     println!("🔓 Unlocking phone...");
     let path = get_config_path();
     if !path.exists() {
-        println!("⚠️  No unlock PIN/password saved. Run 'phonectl config' first.");
+        println!("⚠️  No unlock credentials saved. Run 'phonectl config' first.");
         return;
     }
 
     let encrypted = fs::read_to_string(path).unwrap();
-    let pin = match decrypt_data(&encrypted) {
+    let credential = match decrypt_data(&encrypted) {
         Ok(p) => p,
         Err(e) => {
             println!("❌ Failed to decrypt unlock code: {}", e);
@@ -527,26 +590,108 @@ fn unlock_phone() {
 
     animation_spinner("Unlocking phone");
 
+    // Get screen dimensions for device-agnostic gestures
+    let screen_info = adb_output(&["shell", "dumpsys", "window", "displays"]);
+    let (width, height) = parse_screen_dimensions(&screen_info);
+
     // Wake up the screen
     adb(&["shell", "input", "keyevent", "KEYCODE_WAKEUP"]);
     sleep(Duration::from_millis(500));
 
-    // Swipe up to unlock (for swipe unlock screens)
-    adb(&["shell", "input", "swipe", "500", "1000", "500", "500"]);
-    sleep(Duration::from_millis(500));
-
-    // Enter PIN/password
-    adb(&["shell", "input", "text", &pin.trim().replace(" ", "")]);
-    sleep(Duration::from_millis(300));
-
-    // Press Enter
-    adb(&["shell", "input", "keyevent", "KEYCODE_ENTER"]);
-    sleep(Duration::from_millis(500));
+    // Check credential type
+    if credential.starts_with("PIN:") {
+        try_pin_unlock(&credential[4..], width, height);
+    } else if credential.starts_with("PATTERN:") {
+        try_pattern_unlock(&credential[8..], width, height);
+    } else {
+        println!("❌ Unknown credential type. Please reconfigure.");
+        return;
+    }
 
     // Keep screen awake
     adb(&["shell", "svc", "power", "stayon", "true"]);
-
     println!("✅ Phone unlocked and screen will stay awake");
+}
+
+fn try_pattern_unlock(pattern: &str, width: i32, height: i32) {
+    println!("🔓 Attempting pattern unlock...");
+
+    // Pattern grid positions (3x3 grid)
+    let grid_size = 3;
+    let grid_width = width / grid_size;
+    let grid_height = height / grid_size;
+
+    // Calculate positions for each number
+    let positions: Vec<(i32, i32)> = (1..=9)
+        .map(|num| {
+            let row = (num - 1) / grid_size;
+            let col = (num - 1) % grid_size;
+            (
+                (col as i32 * grid_width) + (grid_width / 2),
+                (row as i32 * grid_height) + (grid_height / 2),
+            )
+        })
+        .collect();
+
+    // Convert pattern to coordinates
+    let mut pattern_points = Vec::new();
+    for c in pattern.chars() {
+        if let Some(digit) = c.to_digit(10) {
+            if digit > 0 && digit <= 9 {
+                pattern_points.push(positions[(digit - 1) as usize]);
+            }
+        }
+    }
+
+    if pattern_points.is_empty() {
+        println!("❌ Invalid pattern format");
+        return;
+    }
+
+    // Start from first point
+    let (start_x, start_y) = pattern_points[0];
+
+    // Generate swipe command
+    let mut swipe_cmd = format!("{} {}", start_x, start_y);
+    for (x, y) in pattern_points.iter().skip(1) {
+        swipe_cmd.push_str(&format!(" {} {} 100", x, y));
+    }
+
+    // Execute pattern swipe
+    adb(&["shell", "input", "swipe", &swipe_cmd]);
+    sleep(Duration::from_millis(1000));
+
+    println!("✅ Pattern unlock executed");
+}
+
+fn try_pin_unlock(pin: &str, width: i32, height: i32) {
+    println!("🔓 Attempting PIN unlock...");
+
+    // 1. Swipe up to show lock screen
+    let start_y = (height as f32 * 0.8) as i32;
+    let end_y = (height as f32 * 0.2) as i32;
+    adb(&[
+        "shell",
+        "input",
+        "swipe",
+        &(width / 2).to_string(),
+        &start_y.to_string(),
+        &(width / 2).to_string(),
+        &end_y.to_string()
+    ]);
+    sleep(Duration::from_millis(500));
+
+    // 2. Enter PIN/password
+    adb(&["shell", "input", "text", &pin.trim().replace(" ", "")]);
+    sleep(Duration::from_millis(300));
+
+    // 3. Press Enter
+    adb(&["shell", "input", "keyevent", "KEYCODE_ENTER"]);
+    sleep(Duration::from_millis(500));
+
+    // 4. Alternative method: Try DPAD_CENTER if ENTER doesn't work
+    adb(&["shell", "input", "keyevent", "KEYCODE_DPAD_CENTER"]);
+    sleep(Duration::from_millis(500));
 }
 
 fn wake_phone() {
@@ -576,6 +721,38 @@ fn adb(args: &[&str]) {
     if !status.success() {
         eprintln!("❌ ADB command failed: {:?}", args);
     }
+}
+
+fn adb_output(args: &[&str]) -> String {
+    let output = Command::new("adb")
+        .args(args)
+        .output()
+        .expect("Failed to execute ADB command");
+
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn parse_screen_dimensions(info: &str) -> (i32, i32) {
+    // Default dimensions for common devices
+    let mut width = 1080;
+    let mut height = 1920;
+
+    // Try to parse actual dimensions
+    if let Some(size) = info.find("init=") {
+        let rest = &info[size+5..];
+        if let Some(end) = rest.find(' ') {
+            let dims = &rest[..end];
+            let parts: Vec<&str> = dims.split('x').collect();
+            if parts.len() == 2 {
+                if let (Ok(w), Ok(h)) = (parts[0].parse(), parts[1].parse()) {
+                    width = w;
+                    height = h;
+                }
+            }
+        }
+    }
+
+    (width, height)
 }
 
 fn is_adb_connected() -> bool {
@@ -770,6 +947,77 @@ fn dial_prompt(query: &str) {
     prompt_and_exec(filtered, "dial");
 }
 
+// Enhanced answer call with device-agnostic approach
+fn answer_call() {
+    println!("📞 Answering call...");
+
+    // Universal method 1: Headset hook (works for most devices)
+    adb(&["shell", "input", "keyevent", "KEYCODE_HEADSETHOOK"]);
+    sleep(Duration::from_millis(500));
+
+    // Universal method 2: Call button
+    adb(&["shell", "input", "keyevent", "KEYCODE_CALL"]);
+    sleep(Duration::from_millis(500));
+
+    // Adaptive swipe method based on screen size
+    let screen_info = adb_output(&["shell", "dumpsys", "window", "displays"]);
+    let (width, height) = parse_screen_dimensions(&screen_info);
+
+    // Calculate swipe positions (from bottom-right to center)
+    let start_x = (width as f32 * 0.8) as i32;
+    let start_y = (height as f32 * 0.8) as i32;
+    let end_x = width / 2;
+    let end_y = height / 2;
+
+    adb(&[
+        "shell",
+        "input",
+        "swipe",
+        &start_x.to_string(),
+        &start_y.to_string(),
+        &end_x.to_string(),
+        &end_y.to_string(),
+        "1000"  // Duration in ms
+    ]);
+
+    println!("✅ Call answered");
+}
+
+// Enhanced end call with multiple methods
+fn end_call() {
+    println!("📞 Ending call...");
+
+    // Try each method until one succeeds
+    let methods = [
+        ("KEYCODE_ENDCALL", "Standard end call"),
+        ("KEYCODE_HEADSETHOOK", "Headset hook"),
+        ("KEYCODE_BACK", "Back button"),
+    ];
+
+    for (keycode, description) in methods.iter() {
+        println!("- Trying {} method...", description);
+        let success = adb_command_success(&["shell", "input", "keyevent", keycode]);
+        sleep(Duration::from_millis(500));
+
+        if success {
+            println!("✅ Call ended using {}", description);
+            return;
+        }
+    }
+
+    println!("⚠️ Failed to end call. Phone might already be idle.");
+}
+
+fn adb_command_success(args: &[&str]) -> bool {
+    Command::new("adb")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 // Audio routing functions
 fn handle_audio(command: &str) {
     match command {
@@ -780,18 +1028,64 @@ fn handle_audio(command: &str) {
     }
 }
 
-fn get_distro_hint() -> &'static str {
-    if std::path::Path::new("/etc/fedora-release").exists() {
-        "sudo dnf install sox nmap-ncat"
-    } else if std::path::Path::new("/etc/debian_version").exists() {
-        "sudo apt install sox netcat-openbsd"
-    } else if std::path::Path::new("/etc/arch-release").exists() {
-        "sudo pacman -S sox netcat"
+fn command_exists(command: &str) -> bool {
+    Command::new("which")
+        .arg(command)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn install_sndcpy_apk() -> Result<(), String> {
+    println!("📱 Installing sndcpy APK on phone...");
+
+    // First, create the APK file in a temporary location
+    let temp_dir = std::env::temp_dir();
+    let apk_path = temp_dir.join("sndcpy.apk");
+
+    // Write the embedded APK data to the temporary file
+    fs::write(&apk_path, APK)
+        .map_err(|e| format!("Failed to write APK file: {}", e))?;
+
+    // Check if APK file was created successfully
+    if !apk_path.exists() {
+        return Err("APK file was not created successfully".to_string());
+    }
+
+    println!("📦 APK file created at: {}", apk_path.display());
+
+    // Try to uninstall existing version first (ignore errors)
+    println!("🔄 Removing existing sndcpy installation...");
+    let _ = Command::new("adb")
+        .args(&["uninstall", "com.rom1v.sndcpy"])
+        .output(); // Don't fail if this doesn't work
+
+    // Wait a bit for uninstall to complete
+    sleep(Duration::from_millis(1000));
+
+    // Install the APK
+    println!("📲 Installing sndcpy APK...");
+    let install_result = Command::new("adb")
+        .args(&["install", "-r", apk_path.to_str().unwrap()])
+        .output()
+        .map_err(|e| format!("Failed to execute ADB install: {}", e))?;
+
+    // Clean up the temporary APK file
+    let _ = fs::remove_file(&apk_path);
+
+    if install_result.status.success() {
+        println!("✅ sndcpy APK installed successfully");
+        Ok(())
     } else {
-        "Install sox and netcat using your distro's package manager"
+        let stderr = String::from_utf8_lossy(&install_result.stderr);
+        let stdout = String::from_utf8_lossy(&install_result.stdout);
+        Err(format!("APK installation failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr))
     }
 }
 
+// Modified start_audio_routing function with proper APK handling
 fn start_audio_routing() {
     if AUDIO_ACTIVE.load(Ordering::SeqCst) {
         println!("🔊 Audio routing is already active");
@@ -800,7 +1094,26 @@ fn start_audio_routing() {
 
     println!("🔊 Starting audio routing...");
 
-    // 1. Set up port forwarding
+    // Step 1: Install APK on phone if needed
+    println!("📱 Checking sndcpy APK installation...");
+    let apk_installed = Command::new("adb")
+        .args(&["shell", "pm", "list", "packages", "com.rom1v.sndcpy"])
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
+
+    if !apk_installed {
+        println!("📦 Installing sndcpy APK...");
+        if let Err(e) = install_sndcpy_apk() {
+            println!("❌ Failed to install sndcpy APK: {}", e);
+            return;
+        }
+    } else {
+        println!("✅ sndcpy APK already installed");
+    }
+
+    // Step 2: Set up port forwarding
+    println!("🔄 Setting up port forwarding...");
     let forward = Command::new("adb")
         .args(&["forward", &format!("tcp:{}", AUDIO_FORWARD_PORT), &format!("tcp:{}", AUDIO_FORWARD_PORT)])
         .status()
@@ -812,48 +1125,190 @@ fn start_audio_routing() {
         return;
     }
 
-    // 2. Start audio output (phone to PC)
-    let audio_output = Command::new("sndcpy")
-        .spawn()
-        .map(|_| {
-            println!("✅ Phone audio → PC speakers");
-            true
-        })
-        .unwrap_or_else(|_| {
-            println!("❌ Failed to start sndcpy. Install it from https://github.com/rom1v/sndcpy");
-            false
-        });
+    // Step 3: Start sndcpy app on phone
+    println!("🎵 Starting sndcpy app on phone...");
+    let start_app = Command::new("adb")
+        .args(&["shell", "am", "start", "-n", "com.rom1v.sndcpy/.MainActivity"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
 
-    // 3. Start microphone input (PC to phone)
-    let mic_input = if audio_output {
-        Command::new("bash")
-            .arg("-c")
-            .arg(&format!(
-                "arecord -f cd - | nc localhost {}",
-                AUDIO_FORWARD_PORT
-            ))
-            .spawn()
-            .map(|_| {
-                println!("✅ PC microphone → Phone call");
-                true
-            })
-            .unwrap_or_else(|_| {
-                println!("❌ Failed to start microphone routing. Ensure:");
-                println!("   • arecord and netcat are installed");
-                println!("   • {}", get_distro_hint());
-                false
-            })
-    } else {
-        false
-    };
+    if !start_app {
+        println!("❌ Failed to start sndcpy app on phone");
+        return;
+    }
 
-    if audio_output && mic_input {
-        AUDIO_ACTIVE.store(true, Ordering::SeqCst);
-        println!("🎧 Audio routing active! Press Ctrl+C in this terminal to stop.");
-    } else {
-        println!("❌ Audio routing failed to start completely");
+    // Step 4: Wait for app to initialize
+    sleep(Duration::from_secs(2));
+
+    // Step 5: Start audio capture on PC
+    println!("🎧 Starting audio capture on PC...");
+
+    // Check if we have the PC client
+    if !command_exists("sndcpy") {
+        println!("🔄 sndcpy PC client not found. Installing...");
+        match install_sndcpy_client() {
+            Ok(_) => println!("✅ sndcpy PC client installed successfully"),
+            Err(e) => {
+                println!("❌ Failed to install sndcpy PC client: {}", e);
+                println!("💡 You can manually download from: https://github.com/rom1v/sndcpy/releases");
+                return;
+            }
+        }
+    }
+
+    // Start the PC client
+    let audio_process = Command::new("sndcpy")
+        .arg(&format!("localhost:{}", AUDIO_FORWARD_PORT))
+        .spawn();
+
+    match audio_process {
+        Ok(_) => {
+            AUDIO_ACTIVE.store(true, Ordering::SeqCst);
+            println!("🎧 Audio routing active!");
+            println!("💡 Audio from phone calls will now play through your PC speakers");
+        }
+        Err(e) => {
+            println!("❌ Failed to start audio routing: {}", e);
+        }
     }
 }
+
+// Separate function to install the PC client
+fn install_sndcpy_client() -> Result<(), String> {
+    println!("📥 Installing sndcpy PC client...");
+
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let bin_dir = home.join(".local/bin");
+    fs::create_dir_all(&bin_dir)
+        .map_err(|e| format!("Failed to create bin directory: {}", e))?;
+
+    // Download the appropriate binary for the system
+    let download_url = if cfg!(target_os = "linux") {
+        "https://github.com/rom1v/sndcpy/releases/download/v1.1/sndcpy-v1.1-linux.zip"
+    } else if cfg!(target_os = "windows") {
+        "https://github.com/rom1v/sndcpy/releases/download/v1.1/sndcpy-v1.1-windows.zip"
+    } else {
+        return Err("Unsupported operating system".to_string());
+    };
+
+    // Download and extract
+    let response = reqwest::blocking::get(download_url)
+        .map_err(|e| format!("Failed to download: {}", e))?;
+
+    let temp_dir = tempfile::tempdir()
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    let zip_path = temp_dir.path().join("sndcpy.zip");
+
+    let mut file = std::fs::File::create(&zip_path)
+        .map_err(|e| format!("Failed to create zip file: {}", e))?;
+
+    let bytes = response.bytes()
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    std::io::Write::write_all(&mut file, &bytes)
+        .map_err(|e| format!("Failed to write zip: {}", e))?;
+
+    // Extract the binary
+    let file = std::fs::File::open(&zip_path)
+        .map_err(|e| format!("Failed to open zip: {}", e))?;
+
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("Failed to read zip: {}", e))?;
+
+    // Find and extract the binary
+    let binary_name = if cfg!(target_os = "windows") { "sndcpy.exe" } else { "sndcpy" };
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)
+            .map_err(|e| format!("Failed to read zip entry: {}", e))?;
+
+        if file.name().ends_with(binary_name) {
+            let output_path = bin_dir.join(binary_name);
+            let mut output_file = std::fs::File::create(&output_path)
+                .map_err(|e| format!("Failed to create output file: {}", e))?;
+
+            std::io::copy(&mut file, &mut output_file)
+                .map_err(|e| format!("Failed to extract binary: {}", e))?;
+
+            // Make executable on Unix systems
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&output_path)
+                    .map_err(|e| format!("Failed to get permissions: {}", e))?
+                    .permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&output_path, perms)
+                    .map_err(|e| format!("Failed to set permissions: {}", e))?;
+            }
+
+            println!("✅ sndcpy installed to ~/.local/bin");
+            return Ok(());
+        }
+    }
+
+    Err("Binary not found in archive".to_string())
+}
+
+// Enhanced debug function for troubleshooting
+fn debug_sndcpy_setup() {
+    println!("🔍 Debug: sndcpy Setup Information");
+    println!("==================================");
+
+    // Check ADB connection
+    let adb_devices = Command::new("adb")
+        .args(&["devices"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|_| "ADB command failed".to_string());
+
+    println!("📱 ADB Devices:");
+    println!("{}", adb_devices);
+
+    // Check if APK is installed
+    let apk_check = Command::new("adb")
+        .args(&["shell", "pm", "list", "packages", "com.rom1v.sndcpy"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|_| "Package check failed".to_string());
+
+    println!("📦 APK Installation Status:");
+    if apk_check.trim().is_empty() {
+        println!("❌ sndcpy APK not installed");
+    } else {
+        println!("✅ sndcpy APK installed: {}", apk_check.trim());
+    }
+
+    // Check PC client
+    let pc_client = command_exists("sndcpy");
+    println!("💻 PC Client Status: {}", if pc_client { "✅ Available" } else { "❌ Not found" });
+
+    // Check port forwarding
+    let port_forward = Command::new("adb")
+        .args(&["forward", "--list"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|_| "Port forward check failed".to_string());
+
+    println!("🔌 Port Forwarding:");
+    if port_forward.trim().is_empty() {
+        println!("❌ No port forwarding active");
+    } else {
+        println!("✅ Active forwards: {}", port_forward.trim());
+    }
+
+    // Check required system tools
+    let tools = ["adb", "arecord", "ncat", "nc"];
+    println!("🛠️ System Tools:");
+    for tool in &tools {
+        let available = command_exists(tool);
+        println!("  • {}: {}", tool, if available { "✅" } else { "❌" });
+    }
+}
+
+// Also fix the start_audio_routing function to handle the error properly
+
 
 fn stop_audio_routing() {
     if !AUDIO_ACTIVE.load(Ordering::SeqCst) {
@@ -863,12 +1318,13 @@ fn stop_audio_routing() {
 
     println!("🔇 Stopping audio routing...");
 
-    // Kill sndcpy processes
+    // Kill audio processes
     let _ = Command::new("pkill")
         .arg("sndcpy")
         .status();
-
-    // Kill netcat processes
+    let _ = Command::new("pkill")
+        .arg("arecord")
+        .status();
     let _ = Command::new("pkill")
         .arg("nc")
         .status();
@@ -893,6 +1349,14 @@ fn check_audio_status() {
         .map(|s| s.success())
         .unwrap_or(false);
 
+    // Check arecord
+    let arecord_running = Command::new("pgrep")
+        .arg("arecord")
+        .stdout(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
     // Check netcat
     let nc_running = Command::new("pgrep")
         .arg("nc")
@@ -909,12 +1373,20 @@ fn check_audio_status() {
         .unwrap_or(false);
 
     println!("  • Audio output active: {}", if sndcpy_running { "✅" } else { "❌" });
-    println!("  • Microphone input active: {}", if nc_running { "✅" } else { "❌" });
+    println!("  • Microphone input active: {}", if arecord_running { "✅" } else { "❌" });
+    println!("  • Netcat routing active: {}", if nc_running { "✅" } else { "❌" });
     println!("  • Port forwarding active: {}", if port_forwarded { "✅" } else { "❌" });
 
-    if sndcpy_running && nc_running && port_forwarded {
+    let ncat_running = Command::new("pgrep")
+        .arg("ncat")
+        .stdout(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if sndcpy_running && arecord_running &&  ncat_running && port_forwarded {
         println!("🔊 Audio routing is fully operational");
-    } else if !sndcpy_running && !nc_running && !port_forwarded {
+    } else if !sndcpy_running && !arecord_running && ! ncat_running && !port_forwarded {
         println!("🔇 Audio routing is inactive");
     } else {
         println!("⚠️ Audio routing is partially active");
