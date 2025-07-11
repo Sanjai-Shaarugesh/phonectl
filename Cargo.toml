@@ -1,7 +1,10 @@
 [package]
 name = "phonectl"
-version = "0.1.0"
+version = "1.0.0"
+authors = ["Sanjai Shaarugesh"]
 edition = "2024"
+license = "MIT"
+
 
 [dependencies]
 aes-gcm = "0.10.3"
