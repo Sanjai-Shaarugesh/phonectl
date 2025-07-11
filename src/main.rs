@@ -81,4 +81,5 @@ fn print_help() {
     println!("");
     println!("First time setup: Connect phone via USB and run 'phonectl setup'");
     println!("Fedora dependencies: sudo dnf install android-tools sox alsa-utils nmap-ncat");
+
 }
