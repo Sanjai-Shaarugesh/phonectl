@@ -62,7 +62,7 @@ fn main() {
 }
 
 fn print_help() {
-    println!("📱 Rust ADB Phone Control CLI v1.5 (Fedora)");
+    println!("📱 Rust ADB Phone Control CLI v1.5");
     println!("===========================================");
     println!("Commands:");
     println!("  setup                     - Complete setup wizard for new device");
