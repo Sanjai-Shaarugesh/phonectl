@@ -12,6 +12,10 @@ repository = "https://github.com/Sanjai-Shaarugesh/phonectl"
 [dependencies]
 aes-gcm = "0.10.3"
 base64 = "0.22.1"
+chrono = "0.4.41"
+clap = "4.5.46"
+crossterm = "0.29.0"
+ctrlc = "3.4.7"
 dir = "0.1.2"
 dirs = "6.0.0"
 engine = "0.0.0"
@@ -20,9 +24,26 @@ regex = "1.11.1"
 reqwest = { version = "0.11", features = ["blocking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.140"
+sysinfo = "0.37.0"
 tempfile = "3.20.0"
 zip = "4.2.0"
 
+[dev-dependencies]
+tokio-test = "0.4"
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[features]
+default = ["camera", "audio"]
+camera = []
+audio = []
+debug = []
+
+[package.metadata.docs.rs]
+features = ["camera", "audio"]
 
 

@@ -257,76 +257,56 @@ pub fn config_install_mode(mode: &str) {
     }
 }
 
+
 pub fn install_packages() -> bool {
-    let required_tools = vec!["adb", "sox", "arecord", "ncat", "pgrep"];
+    let required_tools = vec!["adb", "sox", "arecord", "ncat", "pgrep", "ffmpeg"];
     let missing_tools: Vec<&str> = required_tools
         .into_iter()
         .filter(|tool| !check_tool_installed(tool))
         .collect();
 
     if missing_tools.is_empty() {
-        println!("\x1b[32m✅ All required tools are installed: adb, sox, arecord, ncat, pgrep\x1b[0m");
+        println!("✅ All required tools are installed: adb, sox, arecord, ncat, pgrep, ffmpeg");
         return true;
     }
 
-    println!("\x1b[33m⚠️ Missing required tools: {}\x1b[0m", missing_tools.join(", "));
+    println!("⚠️ Missing required tools: {}", missing_tools.join(", "));
     if let Some((pkg_manager, install_cmd, packages)) = detect_distribution() {
-        println!("\x1b[34m📦 Detected distribution with package manager: {}\x1b[0m", pkg_manager);
-        println!("\x1b[34m📦 Suggested command: {} {}\x1b[0m", install_cmd, packages.join(" "));
+        println!("📦 Detected distribution with package manager: {}", pkg_manager);
+        println!("📦 Suggested command: {} {}", install_cmd, packages.join(" "));
 
         let install_mode = get_install_mode();
         if install_mode == "auto" {
-            println!("\x1b[34m📦 Automatic installation enabled. Installing packages...\x1b[0m");
+            println!("📦 Automatic installation enabled. Installing packages...");
             animation_spinner("Installing dependencies");
             let status = Command::new("sh")
                 .arg("-c")
                 .arg(&format!("{} {}", install_cmd, packages.join(" ")))
                 .status()
                 .map_err(|e| {
-                    println!("\x1b[31m❌ Failed to execute installation command: {}\x1b[0m", e);
+                    println!("❌ Failed to execute installation command: {}", e);
                 });
 
             if let Ok(status) = status {
                 if status.success() {
-                    println!("\x1b[32m✅ Packages installed successfully.\x1b[0m");
+                    println!("✅ Packages installed successfully.");
                     if pkg_manager == "apk" {
-                        println!("\x1b[33m⚠️ Note: You are using a musl-based system (Alpine). The sndcpy binary may not work due to glibc dependency.\x1b[0m");
-                        println!("\x1b[33m💡 Please compile sndcpy from source: https://github.com/rom1v/sndcpy\x1b[0m");
+                        println!("⚠️ Note: You are using a musl-based system (Alpine). The sndcpy binary may not work due to glibc dependency.");
+                        println!("💡 Please compile sndcpy from source: https://github.com/rom1v/sndcpy");
                     }
                     return true;
                 } else {
-                    println!("\x1b[31m❌ Package installation failed. Please install manually: {}\x1b[0m", packages.join(" "));
+                    println!("❌ Package installation failed. Please install manually: {}", packages.join(" "));
                     return false;
                 }
             }
         } else {
-            // Manual mode: prompt with animation
-            let spinner = ["\x1b[31m⠋\x1b[0m", "\x1b[32m⠙\x1b[0m", "\x1b[33m⠹\x1b[0m", "\x1b[34m⠸\x1b[0m", "\x1b[35m⠼\x1b[0m", "\x1b[36m⠴\x1b[0m", "\x1b[31m⠦\x1b[0m", "\x1b[32m⠧\x1b[0m", "\x1b[33m⠇\x1b[0m", "\x1b[34m⠏\x1b[0m"];
-            print!("\x1b[33m📥 Would you like to install the missing packages? (y/n): \x1b[0m");
+            // Manual mode with enhanced prompt for camera features
+            print!("🔥 Would you like to install the missing packages (including FFmpeg for camera features)? (y/n): ");
             io::stdout().flush().unwrap();
 
             let mut input = String::new();
-            let start_time = std::time::Instant::now();
-            let mut i = 0;
-
-            while start_time.elapsed() < Duration::from_secs(30) {
-                print!("\r{} \x1b[33m📥 Would you like to install the missing packages? (y/n): \x1b[0m", spinner[i % spinner.len()]);
-                io::stdout().flush().unwrap();
-                i += 1;
-
-                let mut buffer = [0; 1];
-                if let Ok(n) = io::stdin().read(&mut buffer) {
-                    if n > 0 {
-                        input.push(buffer[0] as char);
-                        if input.contains('\n') || input.contains('\r') {
-                            break;
-                        }
-                    }
-                }
-                sleep(Duration::from_millis(100));
-            }
-            print!("\r\x1b[K"); // Clear the line
-            io::stdout().flush().unwrap();
+            io::stdin().read_line(&mut input).unwrap();
 
             let response = input.trim().to_lowercase();
             if response == "y" || response == "yes" {
@@ -336,35 +316,36 @@ pub fn install_packages() -> bool {
                     .arg(&format!("{} {}", install_cmd, packages.join(" ")))
                     .status()
                     .map_err(|e| {
-                        println!("\x1b[31m❌ Failed to execute installation command: {}\x1b[0m", e);
+                        println!("❌ Failed to execute installation command: {}", e);
                     });
 
                 if let Ok(status) = status {
                     if status.success() {
-                        println!("\x1b[32m✅ Packages installed successfully.\x1b[0m");
+                        println!("✅ Packages installed successfully.");
                         if pkg_manager == "apk" {
-                            println!("\x1b[33m⚠️ Note: You are using a musl-based system (Alpine). The sndcpy binary may not work due to glibc dependency.\x1b[0m");
-                            println!("\x1b[33m💡 Please compile sndcpy from source: https://github.com/rom1v/sndcpy\x1b[0m");
+                            println!("⚠️ Note: You are using a musl-based system (Alpine). The sndcpy binary may not work due to glibc dependency.");
+                            println!("💡 Please compile sndcpy from source: https://github.com/rom1v/sndcpy");
                         }
                         return true;
                     } else {
-                        println!("\x1b[31m❌ Package installation failed. Please install manually: {}\x1b[0m", packages.join(" "));
+                        println!("❌ Package installation failed. Please install manually: {}", packages.join(" "));
                     }
                 }
             } else {
-                println!("\x1b[31m❌ Skipping package installation. Some features may not work.\x1b[0m");
-                println!("\x1b[33m💡 Manual installation command: {} {}\x1b[0m", install_cmd, packages.join(" "));
-                println!("\x1b[33m💡 Run 'phonectl config-install auto' to enable automatic installation.\x1b[0m");
+                println!("❌ Skipping package installation. Camera and some audio features may not work.");
+                println!("💡 Manual installation command: {} {}", install_cmd, packages.join(" "));
+                println!("💡 Run 'phonectl config-install auto' to enable automatic installation.");
             }
         }
     } else {
-        println!("\x1b[31m❌ Unknown Linux distribution. Please install the following packages manually:\x1b[0m");
-        println!("\x1b[33m  • adb (android-tools)\x1b[0m");
-        println!("\x1b[33m  • sox\x1b[0m");
-        println!("\x1b[33m  • alsa-utils (arecord)\x1b[0m");
-        println!("\x1b[33m  • ncat (nmap or netcat)\x1b[0m");
-        println!("\x1b[33m  • pgrep (procps or procps-ng)\x1b[0m");
-        println!("\x1b[33m💡 Run 'phonectl config-install auto' to enable automatic installation.\x1b[0m");
+        println!("❌ Unknown Linux distribution. Please install the following packages manually:");
+        println!("  • adb (android-tools)");
+        println!("  • sox");
+        println!("  • alsa-utils (arecord)");
+        println!("  • ncat (nmap or netcat)");
+        println!("  • pgrep (procps or procps-ng)");
+        println!("  • ffmpeg (for camera streaming and recording)");
+        println!("💡 Run 'phonectl config-install auto' to enable automatic installation.");
     }
 
     false
