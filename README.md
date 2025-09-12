@@ -16,6 +16,11 @@ cd phonectl
 ./install.sh
 ```
 
+### ➰️ curl command 
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sanjai-Shaarugesh/phonectl/master/install.sh | bash
+```
+
 > 📦 This compiles `phonectl` in release mode and installs it to `/usr/local/bin/`.
 
 ---
@@ -24,6 +29,10 @@ cd phonectl
 
 ```bash
 ./uninstall.sh
+```
+## ➰️ curl command 
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sanjai-Shaarugesh/phonectl/master/uninstall.sh | bash
 ```
 
 > 🧹 This removes the `phonectl` binary from your system.
